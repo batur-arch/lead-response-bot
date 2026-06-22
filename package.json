@@ -1,0 +1,22 @@
+{
+  "name": "lead-response-bot",
+  "version": "1.0.0",
+  "description": "60-second AI lead response SMS bot for US real estate brokerages (TCPA + mini-TCPA + CA SB243 compliant)",
+  "main": "api/lead.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.3",
+    "openai": "^4.77.0",
+    "twilio": "^5.4.0"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "author": "Iseri Agency",
+  "license": "UNLICENSED",
+  "private": true
+}
