@@ -1,21 +1,23 @@
 # Lead Response Bot
 
-**60-second AI SMS lead response bot for US real estate brokerages.**
-TCPA + state mini-TCPA (FL/OK/WA/MD) + CA SB 243 + Fair Housing Act compliant.
+**60-second AI SMS lead response bot for US HVAC + Roofing contractors.**
+TCPA + state mini-TCPA + CA SB 243 + Fair Housing compliant. 5-layer legal defense (risk score 4/100).
 
 Built by Iseri Agency. Stack: Vercel Serverless · Twilio · OpenAI · Upstash Redis.
+
+📋 **See [HVAC-PLAYBOOK.md](./HVAC-PLAYBOOK.md) for sales playbook, cold email sequence, Apollo filters, Loom script, discovery call script, DPA template, audit checklist, and E&O insurance setup.**
 
 ---
 
 ## What it does
 
-1. Broker's website form submits a lead → calls `POST /api/lead`
-2. Bot sends a 60-second SMS introducing itself **as an AI assistant** (CA SB 243), referencing the lead's inquiry and asking a qualifier question (TCPA transactional).
+1. HVAC/Roofing contractor's website form submits a lead → calls `POST /api/lead`
+2. Bot sends a 60-second SMS introducing itself **as an AI assistant** (CA SB 243), referencing the lead's service inquiry, and asking emergency vs planned service.
 3. Lead replies → Twilio webhook hits `POST /api/sms-reply`.
 4. Bot detects opt-out / help / re-subscribe keywords and handles them per TCPA.
-5. Otherwise, GPT-4o-mini generates a qualifier reply (budget, timeline, type, pre-approval) — never quotes prices, never discusses race/religion/family (FHA), never gives mortgage advice.
-6. After 2-3 qualifying answers, bot offers the broker's Calendly link.
-7. All compliance checks (quiet hours, daily caps, opt-out blocks) run **before every outbound send**.
+5. Otherwise, GPT-4o-mini generates qualifier replies (issue type, urgency, property type, zip code) — **never quotes prices, never diagnoses, never recommends brands, never gives DIY advice**.
+6. After 3-4 qualifying answers, bot offers the contractor's Calendly link for free estimate.
+7. All compliance checks (quiet hours, daily caps, opt-out blocks, AI disclosure, safety regex) run **before every outbound send**.
 
 ---
 
@@ -153,17 +155,34 @@ Should return `{ "status": "ok", ... }`. If `misconfigured`, check missing env v
 
 ---
 
-## Onboarding a new broker client (sales-side checklist)
+## Onboarding a new HVAC/Roofing contractor (sales-side checklist)
 
-Before SMS go-live for any broker, broker MUST agree to:
+Before SMS go-live for any contractor, they MUST:
 
-- [ ] Their web lead form includes an **SMS opt-in checkbox**. Suggested language:
-  > "☐ I agree to receive SMS messages from [Broker Name] about my inquiry. Reply STOP to opt out. Msg & data rates may apply."
-- [ ] Broker signs a **Data Processing Agreement (DPA)** treating them as Data Controller and Iseri Agency as Data Processor.
-- [ ] Broker provides for each lead submission: `consent_text`, `consent_url`, `consent_ip`, `consent_ts` (form timestamp).
-- [ ] Broker's website has a public **Privacy Policy** mentioning SMS / third-party processor.
+### A. Pass 5-point Pre-Screen ([HVAC-PLAYBOOK.md §6.5](./HVAC-PLAYBOOK.md))
+- [ ] State contractor license active + verified
+- [ ] BBB rating A or A+, <5 unresolved complaints
+- [ ] Google reviews ≥4.0 stars, 20+ reviews
+- [ ] No active consumer fraud / TCPA lawsuits (PACER + state court)
+- [ ] No insurance fraud / storm chasing / AOB abuse complaints
 
-**If any of the above is missing → DO NOT go live.** This is the line between "compliant agency" and "TCPA defendant."
+### B. Sign hardened DPA ([HVAC-PLAYBOOK.md §6](./HVAC-PLAYBOOK.md))
+- License maintenance clause (4.d)
+- Insurance fraud / deceptive practice prohibition (4.f)
+- Mutual indemnification clauses (9.a-c)
+
+### C. Provide per-lead consent metadata
+- [ ] `consent_text` (exact disclosure language)
+- [ ] `consent_url` (URL of the form)
+- [ ] `consent_ip` (lead's IP at submission)
+- [ ] `consent_ts` (form submission timestamp)
+
+### D. Their lead form must include
+- [ ] **SMS opt-in checkbox** with TCPA disclosure:
+  > "☐ I agree to receive SMS messages from [Company] about my service inquiry. Reply STOP to opt out. Msg & data rates may apply."
+- [ ] Privacy Policy mentioning Iseri Agency as third-party SMS processor
+
+**If ANY of A/B/C/D fails → DO NOT go live.** Risk transfer collapses without these. This is the line between "compliant agency" and "TCPA defendant."
 
 ---
 
@@ -172,13 +191,15 @@ Before SMS go-live for any broker, broker MUST agree to:
 | Law | How we comply |
 |---|---|
 | **TCPA federal** | Implied consent from form fill; opt-out detection (any reasonable means); STOP/HELP keywords; 8am-9pm quiet hours |
-| **FL/OK/WA/MD mini-TCPA** | 8am-**8pm** stricter window; 3 SMS/day per consumer cap |
-| **CA SB 243** | First message always identifies as "AI assistant for [Broker]" |
-| **Fair Housing Act** | System prompt forbids race/religion/family/disability questions |
-| **No RE license needed** | Bot is qualifier only; system prompt forbids prices, valuations, advice |
-| **CCPA/CPRA** | Broker = Data Controller; we = Processor; 90-day data retention; DPA required |
+| **FL/OK/WA/MD mini-TCPA** | 8am-**8pm** stricter window; 3 SMS/day per consumer cap. **First 6 months: Apollo filter excludes these states entirely for extra safety.** |
+| **CA SB 243** | First message always identifies as "AI assistant for [Company]" |
+| **No contractor license needed** | Bot is qualifier only; system prompt forbids pricing, diagnosis, brand recommendations, DIY advice |
+| **HVAC/Roofing safety** | System prompt + regex blocks: refrigerant/compressor diagnosis, brand recs (Carrier, Trane, GAF), warranty advice |
+| **Fair Housing Act** | System prompt forbids race/religion/family/disability questions (relevant for rental/HOA conversations) |
+| **CCPA/CPRA** | Contractor = Data Controller; we = Processor; 90-day data retention; hardened DPA required |
 | **KVKK (Turkey)** | All data in US-East Vercel + Upstash; no Turkey data residency |
 | **A2P 10DLC** | Sole Prop brand + Customer Care campaign registered |
+| **E&O Insurance** | Hiscox $500/yr policy active by Month 2 |
 
 ---
 

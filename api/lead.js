@@ -14,6 +14,9 @@ import {
   saveLeadContext,
   getLeadContext,
   saveConsentRecord,
+  acquireSubmissionLock,
+  incrementBrokerLeadCount,
+  isBrokerOverDailyCap,
 } from '../lib/redis.js';
 
 export const config = {
@@ -69,6 +72,47 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid US phone format' });
   }
 
+  // Sanity check: name must be at least 2 chars, no numbers-only
+  if (name.trim().length < 2 || /^\d+$/.test(name.trim())) {
+    return res.status(400).json({ error: 'Invalid name' });
+  }
+
+  const brokerName = process.env.BROKER_NAME || 'broker';
+
+  // -------- 4.5. IDEMPOTENCY — prevent duplicate submissions --
+  // Broker form may submit twice (network retry, double-click).
+  // 5-minute lock per phone+broker combo. Second submission gets
+  // a 200 OK but no SMS is sent (idempotent behavior).
+  const isFirstSubmission = await acquireSubmissionLock(phoneE164, brokerName);
+  if (!isFirstSubmission) {
+    return res.status(200).json({
+      ok: true,
+      sent: false,
+      reason: 'DUPLICATE_SUBMISSION',
+      detail: 'Lead already processed within last 5 minutes; ignoring duplicate.',
+      leadPhone: phoneE164,
+    });
+  }
+
+  // -------- 4.6. BROKER DAILY CAP — cost protection ---------
+  // Prevent runaway lead floods (bug, attack, storm-season surge).
+  // Default 200/day; broker can request higher via support.
+  const capCheck = await isBrokerOverDailyCap(brokerName);
+  if (capCheck.over) {
+    console.warn(`[lead] Broker ${brokerName} hit daily cap: ${capCheck.count}/${capCheck.cap}`);
+    return res.status(429).json({
+      ok: false,
+      sent: false,
+      reason: 'BROKER_DAILY_CAP',
+      detail: `Broker ${brokerName} exceeded daily lead cap (${capCheck.cap}). Contact Iseri Agency to increase.`,
+      count: capCheck.count,
+      cap: capCheck.cap,
+    });
+  }
+  // Count this submission against the cap (only on first submission, since
+  // duplicates were already rejected above)
+  await incrementBrokerLeadCount(brokerName);
+
   // -------- 5. Save consent record (TCPA proof of consent) -
   // Even if consent fields are missing, save what we have.
   // The broker bears legal responsibility for collecting consent;
@@ -81,7 +125,7 @@ export default async function handler(req, res) {
     consent_url: consent_url || '(not provided by broker — REVIEW)',
     consent_ip: consent_ip || null,
     consent_ts: consent_ts || null,
-    broker: process.env.BROKER_NAME,
+    broker: brokerName,
   });
 
   // -------- 6. Initialize lead context ---------------------
@@ -103,7 +147,7 @@ export default async function handler(req, res) {
   await saveLeadContext(phoneE164, ctx);
 
   // -------- 7. Build the first message ---------------------
-  const firstMsg = buildFirstMessage(ctx, process.env.BROKER_NAME);
+  const firstMsg = buildFirstMessage(ctx, brokerName);
 
   // -------- 8. Send via Twilio (gated by compliance) -------
   const result = await sendSms(phoneE164, firstMsg);

@@ -24,6 +24,7 @@ import {
   markOptOut,
   clearOptOut,
   isOptedOut,
+  shouldHandoffToBroker,
 } from '../lib/redis.js';
 import { sendSms, validateTwilioSignature } from '../lib/twilio.js';
 import { generateReply } from '../lib/openai.js';
@@ -159,6 +160,22 @@ export default async function handler(req, res) {
   // -------- 6. Normal flow → AI reply ----------------------
   ctx.history = ctx.history || [];
   ctx.history.push({ role: 'user', content: messageBody });
+
+  // 6.a. HANDOFF GUARD — if conversation has gone on too long,
+  // hand off to broker instead of letting bot loop infinitely.
+  // Saves OpenAI cost + forces lead toward human conversation.
+  if (shouldHandoffToBroker(ctx.history)) {
+    const handoffMsg =
+      `Thanks for the detail. Let me have a ${process.env.BROKER_NAME} agent ` +
+      `reach out directly — pick a time that works: ${process.env.BROKER_CALENDAR_URL}`;
+    await sendSms(phoneE164, handoffMsg);
+    ctx.history.push({ role: 'assistant', content: handoffMsg });
+    ctx.status = 'handoff_to_broker';
+    ctx.handoffAt = new Date().toISOString();
+    ctx.updatedAt = new Date().toISOString();
+    await saveLeadContext(phoneE164, ctx);
+    return res.status(200).type('text/xml').send('<Response/>');
+  }
 
   const aiCtx = {
     broker: process.env.BROKER_NAME,
