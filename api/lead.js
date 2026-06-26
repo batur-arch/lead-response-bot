@@ -1,10 +1,19 @@
 // ============================================================
 // POST /api/lead
-// Called by the broker's website when a NEW lead fills the form.
+// Called by a BROKER's website when a NEW lead fills the form.
 // Triggers the first SMS (with AI disclosure + qualifier question).
 //
-// Security: requires LEAD_WEBHOOK_SECRET header to prevent abuse.
-// Compliance: runs through canSendNow() gate; queues if quiet hours.
+// MULTI-TENANT FLOW:
+//  1. Broker passes their broker_id (= their Twilio phone number)
+//  2. We look up broker config from Redis
+//  3. We use THEIR Twilio credentials to send the SMS
+//
+// Security:
+//   - Requires LEAD_WEBHOOK_SECRET header
+//   - Requires broker_id (must exist + be active in Redis)
+//   - Requires consent_checked: true (TCPA prior express written consent)
+//
+// Compliance: runs through canSendNow() gate.
 // ============================================================
 
 import { toE164 } from '../lib/areacodes.js';
@@ -18,6 +27,7 @@ import {
   incrementBrokerLeadCount,
   isBrokerOverDailyCap,
 } from '../lib/redis.js';
+import { getBroker, validateBrokerConfig } from '../lib/broker.js';
 
 export const config = {
   runtime: 'nodejs',
@@ -47,24 +57,43 @@ export default async function handler(req, res) {
   }
 
   const {
+    broker_id,        // REQUIRED — broker's Twilio phone number (E.164)
     name,
     phone,
     city,
     property,
     email,
-    // Consent record (broker must send these to prove TCPA compliance):
-    consent_text,    // exact disclosure shown to lead
-    consent_url,     // URL of the form they filled
-    consent_ip,      // their IP at time of submission
-    consent_ts,      // timestamp from broker's form
+    // Consent record (broker MUST send these to prove TCPA compliance):
+    consent_checked,  // REQUIRED — must be boolean true (proof checkbox was ticked)
+    consent_text,     // exact disclosure language shown to lead
+    consent_url,      // URL of the form they filled
+    consent_ip,       // their IP at time of submission
+    consent_ts,       // timestamp from broker's form
   } = body || {};
 
-  // -------- 4. Validation ----------------------------------
+  // -------- 4. Field validation ----------------------------
+  if (!broker_id) {
+    return res.status(400).json({ error: 'Missing broker_id' });
+  }
   if (!phone) {
     return res.status(400).json({ error: 'Missing phone' });
   }
   if (!name) {
     return res.status(400).json({ error: 'Missing name' });
+  }
+
+  // CRITICAL TCPA CHECK: consent_checked must be explicit boolean true.
+  // Anything else (false, undefined, "true" string, 1) is REJECTED.
+  // This prevents brokers from pushing leads without verifying consent.
+  if (consent_checked !== true) {
+    return res.status(400).json({
+      error: 'Consent verification required',
+      detail:
+        'Lead submissions must include consent_checked: true (boolean). ' +
+        'The broker form MUST require an explicit opt-in checkbox before submission. ' +
+        'TCPA requires prior express written consent — and the disclosure must state ' +
+        '"Consent is not a condition of purchase."',
+    });
   }
 
   const phoneE164 = toE164(phone);
@@ -77,13 +106,26 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid name' });
   }
 
-  const brokerName = process.env.BROKER_NAME || 'broker';
+  // -------- 5. Look up broker config in Redis --------------
+  const broker = await getBroker(broker_id);
+  if (!broker) {
+    return res.status(404).json({
+      error: 'Broker not found or inactive',
+      detail: `No active broker found with id ${broker_id}. Contact Iseri Agency.`,
+    });
+  }
 
-  // -------- 4.5. IDEMPOTENCY — prevent duplicate submissions --
-  // Broker form may submit twice (network retry, double-click).
-  // 5-minute lock per phone+broker combo. Second submission gets
-  // a 200 OK but no SMS is sent (idempotent behavior).
-  const isFirstSubmission = await acquireSubmissionLock(phoneE164, brokerName);
+  try {
+    validateBrokerConfig(broker);
+  } catch (err) {
+    return res.status(500).json({
+      error: 'Broker misconfigured',
+      detail: err.message,
+    });
+  }
+
+  // -------- 6. IDEMPOTENCY — prevent duplicate submissions --
+  const isFirstSubmission = await acquireSubmissionLock(phoneE164, broker.id);
   if (!isFirstSubmission) {
     return res.status(200).json({
       ok: true,
@@ -91,53 +133,51 @@ export default async function handler(req, res) {
       reason: 'DUPLICATE_SUBMISSION',
       detail: 'Lead already processed within last 5 minutes; ignoring duplicate.',
       leadPhone: phoneE164,
+      brokerId: broker.id,
     });
   }
 
-  // -------- 4.6. BROKER DAILY CAP — cost protection ---------
-  // Prevent runaway lead floods (bug, attack, storm-season surge).
-  // Default 200/day; broker can request higher via support.
-  const capCheck = await isBrokerOverDailyCap(brokerName);
+  // -------- 7. BROKER DAILY CAP — cost protection ----------
+  const capCheck = await isBrokerOverDailyCap(broker.id, broker.daily_cap);
   if (capCheck.over) {
-    console.warn(`[lead] Broker ${brokerName} hit daily cap: ${capCheck.count}/${capCheck.cap}`);
+    console.warn(
+      `[lead] Broker ${broker.id} hit daily cap: ${capCheck.count}/${capCheck.cap}`,
+    );
     return res.status(429).json({
       ok: false,
       sent: false,
       reason: 'BROKER_DAILY_CAP',
-      detail: `Broker ${brokerName} exceeded daily lead cap (${capCheck.cap}). Contact Iseri Agency to increase.`,
+      detail: `Broker ${broker.name} exceeded daily lead cap (${capCheck.cap}). Contact Iseri Agency to increase.`,
       count: capCheck.count,
       cap: capCheck.cap,
     });
   }
-  // Count this submission against the cap (only on first submission, since
-  // duplicates were already rejected above)
-  await incrementBrokerLeadCount(brokerName);
+  await incrementBrokerLeadCount(broker.id);
 
-  // -------- 5. Save consent record (TCPA proof of consent) -
-  // Even if consent fields are missing, save what we have.
-  // The broker bears legal responsibility for collecting consent;
-  // we store the audit trail.
+  // -------- 8. Save consent record (TCPA proof of consent) --
   await saveConsentRecord(phoneE164, {
     receivedAt: new Date().toISOString(),
     name,
     email,
+    consent_checked: true,
     consent_text: consent_text || '(not provided by broker — REVIEW)',
     consent_url: consent_url || '(not provided by broker — REVIEW)',
     consent_ip: consent_ip || null,
     consent_ts: consent_ts || null,
-    broker: brokerName,
+    brokerId: broker.id,
+    brokerName: broker.name,
   });
 
-  // -------- 6. Initialize lead context ---------------------
-  // If lead already exists (resubmitted form), preserve audit history.
+  // -------- 9. Initialize lead context ---------------------
   const existing = (await getLeadContext(phoneE164)) || {};
   const ctx = {
     ...existing,
     phone: phoneE164,
     name,
     email: email || existing.email || null,
-    city: city || existing.city || null,
+    city: city || existing.city || broker.service_area_city || null,
     property: property || existing.property || null,
+    brokerId: broker.id,
     status: 'qualifying',
     createdAt: existing.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -146,24 +186,25 @@ export default async function handler(req, res) {
   };
   await saveLeadContext(phoneE164, ctx);
 
-  // -------- 7. Build the first message ---------------------
-  const firstMsg = buildFirstMessage(ctx, brokerName);
+  // -------- 10. Build the first message ---------------------
+  const firstMsg = buildFirstMessage(ctx, broker);
 
-  // -------- 8. Send via Twilio (gated by compliance) -------
-  const result = await sendSms(phoneE164, firstMsg);
+  // -------- 11. Send via THIS BROKER's Twilio ---------------
+  const result = await sendSms(broker, phoneE164, firstMsg);
 
-  // -------- 9. Update history if sent ----------------------
+  // -------- 12. Update history if sent ---------------------
   if (result.sent) {
     ctx.history.push({ role: 'assistant', content: firstMsg });
     await saveLeadContext(phoneE164, ctx);
   }
 
-  // -------- 10. Respond ------------------------------------
+  // -------- 13. Respond ------------------------------------
   return res.status(200).json({
     ok: true,
     sent: result.sent,
     reason: result.reason,
     detail: result.detail || null,
     leadPhone: phoneE164,
+    brokerId: broker.id,
   });
 }

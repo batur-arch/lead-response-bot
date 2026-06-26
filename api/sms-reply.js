@@ -1,13 +1,20 @@
 // ============================================================
 // POST /api/sms-reply
-// Twilio webhook called when lead REPLIES to our SMS.
+// Twilio webhook called when a lead REPLIES to our SMS.
+//
+// MULTI-TENANT FLOW:
+//  1. Twilio sends with body.To = the BROKER's number
+//  2. We look up broker config in Redis by body.To
+//  3. We validate signature using THAT broker's auth token
+//  4. We use THAT broker's Twilio credentials to reply
 //
 // Flow:
-//  1. Validate Twilio signature (security)
-//  2. Detect opt-out → confirm + block + exit
-//  3. Detect HELP → reply with broker info + exit
-//  4. Detect re-subscribe (START) → clear opt-out
-//  5. Normal reply → check compliance gate → AI generates reply → send
+//  1. Identify broker from req.body.To
+//  2. Validate Twilio signature (using broker's auth token)
+//  3. Detect opt-out → confirm + block + exit
+//  4. Detect HELP → reply with broker info + exit
+//  5. Detect re-subscribe (START) → clear opt-out
+//  6. Normal reply → check compliance gate → AI generates reply → send
 //
 // Twilio sends form-encoded body (NOT JSON). Vercel parses automatically.
 // ============================================================
@@ -26,9 +33,11 @@ import {
   isOptedOut,
   shouldHandoffToBroker,
 } from '../lib/redis.js';
+import { getBroker } from '../lib/broker.js';
 import { sendSms, validateTwilioSignature } from '../lib/twilio.js';
 import { generateReply } from '../lib/openai.js';
 import { toE164 } from '../lib/areacodes.js';
+import twilio from 'twilio';
 
 export const config = {
   runtime: 'nodejs',
@@ -45,30 +54,39 @@ export default async function handler(req, res) {
     return res.status(405).send('Method not allowed');
   }
 
-  // -------- 1. Twilio signature validation -----------------
-  // Skip in dev environments where the signature check is unreliable.
+  // -------- 1. Extract recipient (broker) + sender (lead) --
+  const fromPhone = req.body?.From;       // the LEAD's phone
+  const toPhone = req.body?.To;            // the BROKER's Twilio number
+  const messageBody = req.body?.Body || '';
+  const messageSid = req.body?.MessageSid;
+
+  if (!fromPhone || !toPhone || !messageBody) {
+    return res.status(400).send('Missing From, To, or Body');
+  }
+
+  const phoneE164 = toE164(fromPhone) || fromPhone;
+  const brokerNumberE164 = toE164(toPhone) || toPhone;
+
+  // -------- 2. Look up broker by the receiving number ------
+  const broker = await getBroker(brokerNumberE164);
+  if (!broker) {
+    console.warn(`[sms-reply] No broker found for receiving number ${brokerNumberE164}`);
+    return res.status(404).send('Broker not configured');
+  }
+
+  // -------- 3. Twilio signature validation -----------------
   const isProd = process.env.NODE_ENV === 'production';
   if (isProd) {
-    if (!validateTwilioSignature(req)) {
+    if (!validateTwilioSignature(req, broker)) {
       console.warn('[sms-reply] Invalid Twilio signature — possible spoof attempt');
       return res.status(403).send('Forbidden');
     }
   }
 
-  // -------- 2. Extract lead message & sender ---------------
-  const fromPhone = req.body?.From;
-  const messageBody = req.body?.Body || '';
-  const messageSid = req.body?.MessageSid;
-
-  if (!fromPhone || !messageBody) {
-    return res.status(400).send('Missing From or Body');
-  }
-
-  const phoneE164 = toE164(fromPhone) || fromPhone;
-
-  // -------- 3. Log inbound to audit ------------------------
+  // -------- 4. Log inbound to audit ------------------------
   const ctx = (await getLeadContext(phoneE164)) || {
     phone: phoneE164,
+    brokerId: broker.id,
     history: [],
     audit: [],
     status: 'unknown',
@@ -80,11 +98,11 @@ export default async function handler(req, res) {
       body: messageBody,
       status: 'received',
       reason: 'OK',
-      meta: { sid: messageSid },
+      meta: { sid: messageSid, brokerId: broker.id },
     }),
   );
 
-  // -------- 4. Opt-out / opt-in / help detection -----------
+  // -------- 5. Opt-out / opt-in / help detection -----------
   const signal = detectOptOut(messageBody);
 
   // CASE A: Lead opted out
@@ -98,25 +116,20 @@ export default async function handler(req, res) {
         body: messageBody,
         status: 'optout',
         reason: signal.keyword,
+        meta: { brokerId: broker.id },
       }),
     );
     await saveLeadContext(phoneE164, ctx);
 
-    // Send confirmation (TCPA requires confirming opt-out reception)
-    // NOTE: We DO send this one final confirmation; FCC explicitly allows
-    // a single confirmation message after opt-out.
-    const confirmMsg = buildOptOutConfirmation(process.env.BROKER_NAME);
+    // FCC explicitly allows ONE confirmation message after opt-out.
+    // Bypass compliance gate ONLY for this single confirmation.
+    const confirmMsg = buildOptOutConfirmation(broker.name);
 
-    // Bypass compliance gate ONLY for this single confirmation —
-    // but log it. We do this by calling Twilio directly via the helper.
     try {
-      const twilio = (await import('twilio')).default(
-        process.env.TWILIO_ACCOUNT_SID,
-        process.env.TWILIO_AUTH_TOKEN,
-      );
-      await twilio.messages.create({
+      const directClient = twilio(broker.twilio_account_sid, broker.twilio_auth_token);
+      await directClient.messages.create({
         to: phoneE164,
-        from: process.env.TWILIO_PHONE_NUMBER,
+        from: broker.twilio_phone_number,
         body: confirmMsg,
       });
     } catch (err) {
@@ -134,41 +147,38 @@ export default async function handler(req, res) {
     await saveLeadContext(phoneE164, ctx);
 
     await sendSms(
+      broker,
       phoneE164,
-      `Welcome back. You're re-subscribed to ${process.env.BROKER_NAME} messages. Reply STOP anytime to opt out.`,
+      `Welcome back. You're re-subscribed to ${broker.name} messages. Reply STOP anytime to opt out.`,
     );
     return res.status(200).type('text/xml').send('<Response/>');
   }
 
   // CASE C: HELP request
   if (signal.type === 'help') {
-    await sendSms(
-      phoneE164,
-      buildHelpMessage(process.env.BROKER_NAME, process.env.BROKER_EMAIL),
-    );
+    await sendSms(broker, phoneE164, buildHelpMessage(broker.name, broker.email));
     await saveLeadContext(phoneE164, ctx);
     return res.status(200).type('text/xml').send('<Response/>');
   }
 
-  // -------- 5. If currently opted out, ignore --------------
+  // -------- 6. If currently opted out, ignore --------------
   if (await isOptedOut(phoneE164)) {
     await saveLeadContext(phoneE164, ctx);
     console.log(`[sms-reply] Message from opted-out lead ${phoneE164} — ignored`);
     return res.status(200).type('text/xml').send('<Response/>');
   }
 
-  // -------- 6. Normal flow → AI reply ----------------------
+  // -------- 7. Normal flow → AI reply ----------------------
   ctx.history = ctx.history || [];
   ctx.history.push({ role: 'user', content: messageBody });
 
-  // 6.a. HANDOFF GUARD — if conversation has gone on too long,
+  // 7.a. HANDOFF GUARD — if conversation has gone on too long,
   // hand off to broker instead of letting bot loop infinitely.
-  // Saves OpenAI cost + forces lead toward human conversation.
   if (shouldHandoffToBroker(ctx.history)) {
     const handoffMsg =
-      `Thanks for the detail. Let me have a ${process.env.BROKER_NAME} agent ` +
-      `reach out directly — pick a time that works: ${process.env.BROKER_CALENDAR_URL}`;
-    await sendSms(phoneE164, handoffMsg);
+      `Thanks for the detail. Let me have a ${broker.name} agent ` +
+      `reach out directly — pick a time that works: ${broker.calendar_url}`;
+    await sendSms(broker, phoneE164, handoffMsg);
     ctx.history.push({ role: 'assistant', content: handoffMsg });
     ctx.status = 'handoff_to_broker';
     ctx.handoffAt = new Date().toISOString();
@@ -177,36 +187,29 @@ export default async function handler(req, res) {
     return res.status(200).type('text/xml').send('<Response/>');
   }
 
-  const aiCtx = {
-    broker: process.env.BROKER_NAME,
-    brokerCalendarUrl: process.env.BROKER_CALENDAR_URL,
-    city: ctx.city,
-  };
-
   // Cap history at last 12 messages to keep token cost low
   const recentHistory = ctx.history.slice(-12).slice(0, -1);
 
-  const reply = await generateReply(recentHistory, messageBody, aiCtx);
+  const reply = await generateReply(recentHistory, messageBody, broker, { city: ctx.city });
 
-  // -------- 7. Send AI reply (through compliance gate) -----
-  const result = await sendSms(phoneE164, reply);
+  // -------- 8. Send AI reply (through compliance gate) -----
+  const result = await sendSms(broker, phoneE164, reply);
 
   if (result.sent) {
     ctx.history.push({ role: 'assistant', content: reply });
   } else {
-    // Send blocked (e.g. quiet hours) — log and skip; will retry next window
     ctx.audit.push(
       newAuditEntry({
         direction: 'outbound',
         body: reply,
         status: 'blocked',
         reason: result.reason,
+        meta: { brokerId: broker.id },
       }),
     );
   }
   ctx.updatedAt = new Date().toISOString();
   await saveLeadContext(phoneE164, ctx);
 
-  // Twilio expects 200 with empty TwiML response (or 204)
   return res.status(200).type('text/xml').send('<Response/>');
 }

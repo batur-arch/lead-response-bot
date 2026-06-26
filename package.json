@@ -1,15 +1,18 @@
 {
   "name": "lead-response-bot",
   "version": "1.0.0",
-  "description": "60-second AI lead response SMS bot for US real estate brokerages (TCPA + mini-TCPA + CA SB243 compliant)",
+  "description": "AI lead-response SMS bot for US HVAC + Roofing contractors. Multi-tenant. TCPA + state mini-TCPA + CA SB243 compliant.",
   "main": "api/lead.js",
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "deploy": "vercel --prod",
+    "seed-broker": "node scripts/seed-broker.js",
+    "list-brokers": "node scripts/list-brokers.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.34.3",
+    "dotenv": "^16.4.5",
     "openai": "^4.77.0",
     "twilio": "^5.4.0"
   },
